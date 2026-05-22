@@ -888,6 +888,12 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
+        # Carries can_skip_mamba_postprocess prediction from _prepare_inputs
+        # (pre-forward) to _update_states_after_model_execute (post-forward).
+        # Set to True when staging was elided this step because no request will
+        # cross a mamba block boundary — the post-forward path must then skip
+        # the fused kernel and use the deferred-sync fast path.
+        self._mamba_skip_postprocess_predicted: bool = False
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
         if self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0:
             self.mamba_prev_last_scheduled_idx = self._make_buffer(
@@ -1504,20 +1510,22 @@ class GPUModelRunner(
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
         if self.cache_config.mamba_cache_mode == "align":
-            # Orthogonal composition of PR #42574 and PR #40172:
+            # Orthogonal composition of PR #42574 and PR #40172, with the
+            # skip-prediction hoisted into _prepare_inputs (pre-forward) so
+            # that the staging H→D copies are also elided on skip steps:
             #   PR #42574 controls WHEN postprocess runs (skip when provably
             #             no-op — no request crosses a mamba block boundary).
+            #             Decision is made pre-forward and cached on
+            #             self._mamba_skip_postprocess_predicted.
             #   PR #40172 controls WHERE postprocess runs (fused GPU kernel
             #             when align mode and postprocess is needed).
-            mamba_bufs = self._get_mamba_bufs()
-            if mamba_utils.can_skip_mamba_postprocess(
-                scheduler_output,
-                self.input_batch,
-                self.requests,
-                mamba_bufs.preprocess.mamba_spec.block_size,
-                num_reqs,
-            ):
+            skip = self._mamba_skip_postprocess_predicted
+            # Reset so a future code path that bypasses _prepare_inputs cannot
+            # accidentally inherit a stale True.
+            self._mamba_skip_postprocess_predicted = False
+            if skip:
                 # PR #42574 fast-path: defer postprocess via non-blocking copy.
+                # No staging was performed in _prepare_inputs for this step.
                 self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                     self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                 )
@@ -1527,6 +1535,7 @@ class GPUModelRunner(
             # Fallthrough: postprocess required → PR #40172 fused GPU postprocess
             # (no CPU-GPU sync; state copies + per-request accepted-token
             # update all on GPU).
+            mamba_bufs = self._get_mamba_bufs()
             mamba_utils.postprocess_mamba_align_gpu(
                 bufs=mamba_bufs,
                 num_reqs=num_reqs,
@@ -4157,15 +4166,37 @@ class GPUModelRunner(
                 # gated on spec-decode + hybrid (see MambaBuffers.create);
                 # without it, ``mamba_bufs.postprocess_align`` is None and
                 # the staging buffers don't exist.
+                #
+                # Compose with PR #42574 idea ("skip postprocess when no
+                # block boundary can be crossed") by predicting the skip
+                # condition HERE — before staging — so that on a predicted-
+                # skip step the 4 H→D metadata copies inside
+                # stage_postprocess_inputs_to_gpu are also elided. Without
+                # this hoist, can_skip is checked only at post-forward
+                # (in _update_states_after_model_execute) and the staging
+                # cost has already been incurred. The prediction is carried
+                # via self._mamba_skip_postprocess_predicted.
                 if mamba_bufs.postprocess_align is not None:
-                    mamba_utils.stage_postprocess_inputs_to_gpu(
-                        mamba_bufs.postprocess_align,
-                        scheduler_output,
-                        self.input_batch.req_ids,
-                        num_reqs,
-                        self.requests,
-                        self.mamba_state_idx,
+                    self._mamba_skip_postprocess_predicted = (
+                        mamba_utils.can_skip_mamba_postprocess(
+                            scheduler_output,
+                            self.input_batch,
+                            self.requests,
+                            mamba_bufs.preprocess.mamba_spec.block_size,
+                            num_reqs,
+                        )
                     )
+                    if not self._mamba_skip_postprocess_predicted:
+                        mamba_utils.stage_postprocess_inputs_to_gpu(
+                            mamba_bufs.postprocess_align,
+                            scheduler_output,
+                            self.input_batch.req_ids,
+                            num_reqs,
+                            self.requests,
+                            self.mamba_state_idx,
+                        )
+                else:
+                    self._mamba_skip_postprocess_predicted = False
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
