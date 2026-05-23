@@ -703,6 +703,48 @@ def preprocess_mamba(
     do_mamba_copy_block(copy_bufs)
 
 
+def can_skip_mamba_postprocess(
+    scheduler_output: SchedulerOutput,
+    input_batch: GPUInputBatch,
+    requests: dict[str, CachedRequestState],
+    mamba_block_size: int,
+    num_reqs: int,
+) -> bool:
+    """Return True iff ``postprocess_mamba_align_gpu`` is provably a no-op for
+    every request this step.
+
+    Math (see PR #42574 for the original observation): the number of newly
+    accepted tokens at this step is bounded above by ``n_draft + 1``. If for
+    every request ``(n_running + n_draft) // block_size * block_size <
+    n_running`` (i.e. no request can cross a mamba block boundary even in the
+    worst case), then the inner conditional inside the fused postprocess
+    kernel ``aligned >= n_running`` is unreachable and the kernel performs no
+    state copy. We can short-circuit the entire postprocess path: skip both
+    the H→D staging in ``_prepare_inputs`` AND the fused-kernel launch in
+    ``_update_states_after_model_execute``.
+
+    Must stay in lockstep with the inner conditional inside
+    :func:`postprocess_mamba_align_gpu`.
+    """
+    if not mamba_block_size or mamba_block_size <= 0:
+        return False
+    num_scheduled = scheduler_output.num_scheduled_tokens
+    spec_decode = scheduler_output.scheduled_spec_decode_tokens
+    req_ids = input_batch.req_ids
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        n_draft = len(spec_decode.get(req_id, ()))
+        n_running = (
+            requests[req_id].num_computed_tokens
+            + num_scheduled[req_id]
+            - n_draft
+        )
+        max_new = n_running + n_draft
+        if (max_new // mamba_block_size) * mamba_block_size >= n_running:
+            return False
+    return True
+
+
 def postprocess_mamba_all(
     scheduler_output: SchedulerOutput,
     kv_cache_config: KVCacheConfig,
